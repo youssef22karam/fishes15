@@ -1,0 +1,375 @@
+import type { Layer } from './types';
+/** One gill opening: a pocket in the flank closed by a free cover whose hind margin lifts with every breath. */
+export interface GillOpening {
+  kind: 'opercle' | 'slit' | 'pore';
+  h0: number; h1: number; // dorsal / ventral end (hN)
+  depth: number; // chamber depth (SL)
+  over: number; // overhang of the soft margin behind the shoulder wall (SL)
+  thick: number; // thickness of the cover at its margin (SL)
+  arches: number; // gill arches seen through the opening
+  amp: number; // relative opening amplitude
+  axil?: boolean; // opening lies behind the pectoral base (anglerfishes)
+  edge: (h: number) => number; // station of the shoulder wall = attachment line of the opening
+  len: (h: number) => number; // length of the pocket in front of it
+}
+import * as THREE from 'three';
+import type { MouthSpec, Species } from './types';
+import { clamp, curve, DEG, lerp, smooth } from './math';
+const PI = Math.PI, PI2 = Math.PI * 2;
+/** smooth maximum: a concave fillet of size k where the two profiles cross */
+const smax = (a: number, b: number, k: number) => {
+  if (k <= 1e-9) return Math.max(a, b);
+  const h = Math.max(k - Math.abs(a - b), 0) / k;
+  return Math.max(a, b) + h * h * k * 0.25;
+};
+/**
+ * Superior (upturned) mouths – tarpon, arowana, herrings, anglerfishes, bettas: the LOWER jaw forms the
+ * tip of the head and the oral cleft starts on the dorsal profile, running down and back.
+ */
+export const isSuperior = (m: MouthSpec) => m.sup ?? ((m.angle >= 32 && m.y > -0.3) || m.y >= 0.2);
+/**
+ * BodyModel – the analytic description of one fish, derived purely from its
+ * morphometrics. Everything attached to the body (fins, eyes, lips, jaws,
+ * barbels, teeth) is positioned through this model so all parts agree.
+ *
+ * Coordinates: loft parameter s ∈ [0,1] (snout → caudal base),
+ * object space: snout points to +X, dorsal is +Y, right flank is +Z.
+ * One loft-length = `L` world units.
+ */
+export class BodyModel {
+  readonly sp: Species;
+  readonly L: number;
+  private cx = new Float64Array(0);
+  private cy = new Float64Array(0);
+  private th = new Float64Array(0);
+  private K = 600;
+  /** curved centreline (seahorses, seadragons) */
+  readonly bent: boolean;
+  readonly mouthTip: { s: number; y: number };
+  readonly rictus: { s: number; y: number };
+  readonly hinge: { s: number; y: number };
+  /** station where the oral arch meets the midline (symphysis of the arch) */
+  readonly sSym: number;
+  /** −1: the cleft arches across the ventral face (inferior / sub-terminal), 0: terminal, +1: across the dorsal face (superior) */
+  readonly wrap: -1 | 0 | 1;
+  /** final normalised height of the eyes */
+  readonly eyeYn: number;
+  /** gill openings (pocket under a free cover) – empty for rays, lampreys, tiny-headed fishes */
+  gills: GillOpening[] = [];
+  /** station of the pectoral fin base: always on the shoulder girdle BEHIND the gill opening */
+  pecStation = 0;
+  /** true while sampling the un-recessed skin (the surface the gill covers follow) */
+  rawMode = false;
+  private gS0 = 2;
+  private gS1 = -1;
+  private arcY0 = 0;
+  private orbRatio = 0;
+  private readonly jaw: boolean;
+  private readonly opercle: boolean;
+  private readonly ed: number;
+  private readonly ev: number;
+  private readonly flat: number;
+  constructor(sp: Species, L = 2) {
+    this.sp = sp;
+    this.L = L;
+    const b = sp.body, m = sp.mouth, e = sp.eye;
+    this.bent = !!(b.bend && b.bend.length > 1);
+    this.flat = b.bellyFlat ?? (b.Wh >= 1.25 && !b.disc ? clamp((b.Wh - 1.15) * 0.9, 0, 0.55) : 0);
+    this.ed = 2 / b.sq;
+    this.ev = 2 / lerp(b.sq, Math.max(b.sq, 3.3), this.flat);
+    this.jaw = (m.kind ?? 'jaw') === 'jaw' && m.gape > 0.004;
+    this.opercle = !b.disc && sp.skin.kind !== 'placoid' && sp.HL > 0.1 && m.kind !== 'disc' && sp.plan !== 'ray';
+    this.buildCenterline();
+    // ── Orbit law: a skull is never narrower than its eyes. The old model made the head width a fixed
+    // fraction of the local depth, so on compressed fishes (tarpon, mackerel, butterflyfishes) the snout
+    // was thinner than one eye – the eyes could not be seated and slid down to the jaw.
+    if (e.d > 0 && sp.plan === 'fish' && !b.disc) {
+      const hd = (this.top(e.s) + this.bot(e.s)) / 2;
+      this.orbRatio = clamp((0.875 * e.d) / Math.max(1e-4, hd), 0, 0.88);
+    }
+    // ── Oral cleft ────────────────────────────────────────────────────────────
+    const a = m.angle * DEG;
+    const yTip0 = this.normY(m.s, m.y);
+    let tip: { s: number; y: number }, ric: { s: number; y: number }, sSym: number, wrap: -1 | 0 | 1 = 0;
+    if (this.jaw && sp.plan === 'fish' && !sp.rostrum && isSuperior(m)) {
+      // upper-jaw symphysis sits on the dorsal profile just behind the projecting chin
+      const sA = clamp(Math.max(m.s, m.jut, 0.09 * m.gape), 0.004, 0.03);
+      const yA = this.top(sA);
+      const rs = clamp(sA + m.gape * Math.cos(a), sA + 0.008, 0.92);
+      const ry = clamp(yA - m.gape * Math.sin(a), -this.bot(rs) * 0.66, this.top(rs) * 0.85);
+      const lead = clamp(0.25 * (rs - sA), 0.003, 0.03);
+      tip = { s: sA + lead, y: Math.min(lerp(yA, ry, lead / (rs - sA)), this.top(sA + lead) * 0.8) };
+      ric = { s: rs, y: ry };
+      sSym = sA; wrap = 1; this.arcY0 = yA;
+    } else {
+      const rs = clamp(m.s + m.gape * Math.cos(a), m.s + 0.004, 0.92);
+      let ry = yTip0 - m.gape * Math.sin(a);
+      // ventral mouths (sharks, sturgeons): the corner follows the ventral contour, never a cheek "smile";
+      // every other mouth keeps a real mandible below its corner (no paper-thin lower jaw)
+      if (m.y <= -0.58 && m.angle < 25) ry = Math.min(ry, -this.bot(rs) * 0.62);
+      else ry = Math.max(ry, -this.bot(rs) * 0.72);
+      ry = clamp(ry, -this.bot(rs) * 0.9, this.top(rs) * 0.9);
+      tip = { s: m.s, y: yTip0 };
+      ric = { s: rs, y: ry };
+      sSym = Math.max(0.0005, m.s);
+      if (this.jaw && m.s > 0.003 && Math.abs(yTip0) > 1e-5) {
+        // sub-terminal / inferior mouth: the front of the cleft is a level slit across the snout, so it
+        // meets the midline exactly where the profile reaches the mouth height (was a V-shaped notch)
+        const prof = yTip0 < 0 ? (s: number) => this.bot(s) : (s: number) => this.top(s);
+        let lo = 0, hi = m.s;
+        for (let i = 0; i < 40; i++) { const mid = (lo + hi) / 2; if (prof(mid) < Math.abs(yTip0)) lo = mid; else hi = mid; }
+        if (m.s - hi > 0.0006) { sSym = Math.max(2e-5, hi); wrap = yTip0 < 0 ? -1 : 1; this.arcY0 = yTip0; }
+      }
+    }
+    this.mouthTip = tip;
+    this.rictus = ric;
+    this.sSym = sSym;
+    this.wrap = wrap;
+    // quadrate–articular joint: slightly behind and below the rictus
+    this.hinge = { s: ric.s + clamp(m.gape * 0.16, 0.006, 0.022), y: ric.y - clamp(m.gape * 0.06, 0.002, 0.009) };
+    // ── Eye height: only eyes set on TOP of the head (mudskippers, stargazers) are moved, and only as far
+    // as needed for the two orbits to clear each other. Lateral eyes stay exactly where they were measured.
+    let yE = e.y;
+    if (e.d > 0 && (sp.plan === 'fish' || sp.plan === 'ray')) {
+      const r = e.d / 2;
+      for (let k = 0; k < 60 && yE > 0.5; k++) {
+        const phi = this.phiAtY(e.s, this.normY(e.s, yE));
+        if (Math.abs(this.sectionYZ(e.s, phi)[1]) >= r * 1.05) break;
+        yE -= 0.012;
+      }
+    }
+    this.eyeYn = yE;
+    // ── gill openings, then the pectoral fin takes its place on the cleithrum behind them
+    const gl = this.makeGills();
+    for (const g of gl) for (let k = 0; k <= 16; k++) {
+      const h = lerp(g.h0, g.h1, k / 16), E = g.edge(h);
+      this.gS0 = Math.min(this.gS0, E - g.len(h) - 0.002);
+      this.gS1 = Math.max(this.gS1, E + 0.002);
+    }
+    this.gills = gl;
+    this.pecStation = this.placePec();
+  }
+  // ── outline ────────────────────────────────────────────────────────────────
+  private front(t: number, b: number) {
+    const a = 1 + b * 1.65;
+    const c = 1 + b * 1.28;
+    return Math.pow(clamp(1 - Math.pow(1 - clamp(t), a)), 1 / c);
+  }
+  private back(t: number, e: number) {
+    return 0.5 + 0.5 * Math.cos(PI * Math.pow(clamp(t), e));
+  }
+  private bumps(s: number, side: 1 | -1) {
+    let v = 0;
+    for (const [bs, h, w, sd] of this.sp.body.bumps ?? []) {
+      if (sd !== side) continue;
+      const d = (s - bs) / w;
+      v += h * Math.exp(-d * d);
+    }
+    return v;
+  }
+  private hypuralFlare(s: number) {
+    const b = this.sp.body;
+    if (b.disc || b.bend || b.P < 0.025 || b.P > 0.3 || this.sp.fins.caudal.span <= 0.08) return 1;
+    return 1 + 0.065 * Math.pow(smooth(0.94, 1.0, s), 1.6);
+  }
+  /** half depth of a tubular snout (rounded tip, slowly widening toward the face) */
+  private snoutR(s: number) {
+    const sn = this.sp.body.snout!;
+    const tip = sn.tip ?? 0.72;
+    const x = clamp(s / sn.len, 0, 1.8);
+    const core = sn.r * (tip + (1 - tip) * Math.pow(Math.min(1, x), 1.3)) * (1 + 0.3 * Math.max(0, x - 1));
+    const cap = Math.sqrt(clamp(1 - Math.pow(1 - clamp(s / (sn.r * tip * 1.15)), 2)));
+    return core * cap;
+  }
+  private withSnout(v: number, s: number) {
+    const sn = this.sp.body.snout!;
+    return smax(v, this.snoutR(s), sn.r * 1.7 * smooth(sn.len * 0.5, sn.len * 0.95, s));
+  }
+  /** dorsal height above the axis (SL units) */
+  top(s: number) {
+    const b = this.sp.body;
+    const Dt = b.D * b.df;
+    const Pt = (b.P / 2 + b.pedY) * this.hypuralFlare(s);
+    const s0 = b.snout ? b.snout.len * 0.88 : 0;
+    let v: number;
+    if (s <= b.pD) {
+      const t = clamp((s - s0) / Math.max(1e-4, b.pD - s0));
+      v = Dt * this.front(t, b.bD);
+      // subtle cranial-to-nuchal inflection on sleek/moderate snouts
+      const nape = b.nape ?? (b.disc || b.bend ? 0 : clamp(0.48 - b.bD, -0.15, 0.32) * 0.22);
+      if (nape !== 0) v -= Dt * nape * Math.sin(PI * Math.pow(t, 0.85)) * (1 - smooth(0.45, 0.95, t));
+    } else {
+      v = Pt + (Dt - Pt) * this.back((s - b.pD) / Math.max(1e-4, 1 - b.pD), b.tD);
+    }
+    v = Math.max(0, v + this.bumps(s, 1) * smooth(0, 0.04, s));
+    return b.snout ? this.withSnout(v, s) : v;
+  }
+  /** ventral depth below the axis (SL units) */
+  bot(s: number) {
+    const b = this.sp.body;
+    const Dv = b.D * (1 - b.df);
+    const Pb = (b.P / 2 - b.pedY) * this.hypuralFlare(s);
+    const s0 = b.snout ? b.snout.len * 0.88 : 0;
+    let v: number;
+    if (s <= b.pV) v = Dv * this.front(clamp((s - s0) / Math.max(1e-4, b.pV - s0)), b.bV);
+    else v = Pb + (Dv - Pb) * this.back((s - b.pV) / Math.max(1e-4, 1 - b.pV), b.tV);
+    v = Math.max(0, v + this.bumps(s, -1) * smooth(0, 0.04, s));
+    return b.snout ? this.withSnout(v, s) : v;
+  }
+  /** half width (SL units) */
+  hw(s: number) {
+    const b = this.sp.body;
+    if (b.disc) return this.discW(s);
+    const hd = (this.top(s) + this.bot(s)) / 2;
+    let ratio = b.W * lerp(b.Wh, 1, smooth(0.02, 0.34, s)) * lerp(1, b.Wt, smooth(0.35, 0.95, s));
+    if (this.orbRatio > 0) {
+      // neurocranium + gill chamber: the head stays wide enough for the orbits, easing into the trunk
+      const e = this.sp.eye, hl = Math.max(this.sp.HL, e.s + e.d);
+      const env = 1 - smooth(lerp(e.s, hl, 0.45), hl * 1.3, s);
+      ratio = smax(ratio, this.orbRatio * env, 0.1);
+    }
+    let w = hd * ratio;
+    if (this.sp.skin.kind === 'placoid' && s > 0.16 && s < 0.26) {
+      // subtle 3D branchial gill-slit fluting on sharks
+      const env = Math.sin(PI * clamp((s - 0.165) / 0.08));
+      w *= 1 - 0.022 * env * (0.5 + 0.5 * Math.sin(((s - 0.17) / 0.015) * PI2));
+    }
+    // lateral compression into the hypural plate at the caudal fin base
+    if (!b.bend && this.sp.fins.caudal.span > 0.06) w *= 1 - 0.46 * Math.pow(smooth(0.92, 1.0, s), 1.5);
+    for (const [bs, e, ww] of b.wbumps ?? []) {
+      const d = (s - bs) / ww;
+      w += e * Math.exp(-d * d * d * d);
+    }
+    if (b.snout) w = smax(w, this.snoutR(s) * 0.84, b.snout.r * 0.6 * smooth(b.snout.len * 0.5, b.snout.len * 0.95, s));
+    return w;
+  }
+  private discW(s: number) {
+    const d = this.sp.body.disc!;
+    const tail = d.tailW * (1 - 0.7 * smooth(d.end, 1, s));
+    let w: number;
+    if (s <= d.pW) {
+      const t = s / d.pW;
+      w = d.span * Math.pow(this.front(t, 0.12), d.fr);
+      if (d.head) w = Math.max(w, d.head * this.front(s / 0.03, 0.8));
+    } else if (s <= d.end) {
+      const t = (s - d.pW) / (d.end - d.pW);
+      w = d.span * Math.pow(1 - t, d.bk);
+    } else w = 0;
+    return Math.max(w, s > d.pW * 0.5 ? tail : 0);
+  }
+  /** half perimeter of a section (SL units) – used for isotropic texturing */
+  halfPerim(s: number) {
+    const h = (this.top(s) + this.bot(s)) / 2;
+    const w = this.hw(s);
+    return PI * Math.sqrt((h * h + w * w) / 2) + 1e-4;
+  }
+  normY(s: number, yn: number) {
+    return yn >= 0 ? yn * this.top(s) : yn * this.bot(s);
+  }
+  // ── centreline (supports seahorse-like bending) ───────────────────────────
+  private buildCenterline() {
+    const K = this.K;
+    const bend = this.sp.body.bend;
+    const f = bend && bend.length > 1 ? curve(bend) : () => 0;
+    this.cx = new Float64Array(K + 1);
+    this.cy = new Float64Array(K + 1);
+    this.th = new Float64Array(K + 1);
+    let x = 0, y = 0;
+    for (let i = 0; i <= K; i++) {
+      const s = i / K;
+      const t = f(s) * DEG;
+      this.th[i] = t;
+      this.cx[i] = x;
+      this.cy[i] = y;
+      x += -Math.cos(t) / K;
+      y += -Math.sin(t) / K;
+    }
+    let mnx = 1e9, mxx = -1e9, mny = 1e9, mxy = -1e9;
+    for (let i = 0; i <= K; i++) {
+      mnx = Math.min(mnx, this.cx[i]); mxx = Math.max(mxx, this.cx[i]);
+      mny = Math.min(mny, this.cy[i]); mxy = Math.max(mxy, this.cy[i]);
+    }
+    const ox = (mnx + mxx) / 2, oy = bend ? (mny + mxy) / 2 : 0;
+    for (let i = 0; i <= K; i++) { this.cx[i] -= ox; this.cy[i] -= oy; }
+  }
+  private sample(arr: Float64Array, s: number) {
+    const f = clamp(s) * this.K;
+    const i = Math.min(this.K - 1, Math.floor(f));
+    const t = f - i;
+    if (s > 1) return arr[this.K] + (arr[this.K] - arr[this.K - 1]) * (s - 1) * this.K;
+    if (s < 0) return arr[0] + (arr[1] - arr[0]) * s * this.K;
+    return lerp(arr[i], arr[i + 1], t);
+  }
+  heading(s: number) {
+    return this.sample(this.th, clamp(s));
+  }
+  /** local (s, y, z) in SL units → object space */
+  local(s: number, y: number, z: number, out = new THREE.Vector3()) {
+    const t = this.heading(s);
+    const nx = -Math.sin(t), ny = Math.cos(t);
+    const cx = this.sample(this.cx, s), cy = this.sample(this.cy, s);
+    return out.set((cx + nx * y) * this.L, (cy + ny * y) * this.L, z * this.L);
+  }
+  /** backward tangent and dorsal normal (object space, unit) */
+  frame(s: number) {
+    const t = this.heading(s);
+    return {
+      T: new THREE.Vector3(-Math.cos(t), -Math.sin(t), 0),
+      N: new THREE.Vector3(-Math.sin(t), Math.cos(t), 0),
+    };
+  }
+  // ── operculum (gill cover) ────────────────────────────────────────────────
+  hasOpercle() {
+    return this.opercle;
+  }
+  /**
+   * Station where the gill cover meets the shoulder at texture height hN (0 dorsal … 1 ventral).
+   * Head length is measured to the hind-most point of the cover, so the margin (plus its soft membrane)
+   * reaches HL at mid flank and sweeps forward toward the nape above and the isthmus below.
+   */
+  opercleS(hN: number) {
+    const hl = this.sp.HL;
+    const bow = 1 - Math.pow(Math.sin(PI * clamp((hN - 0.16) / 0.72)), 0.8);
+    // below the cheek the branchiostegal membrane runs forward under the head toward the isthmus
+    const isth = smooth(0.6, 0.9, hN);
+    return hl * (1 - 0.064 * bow - 0.28 * (hN - 0.52) * (hN - 0.52) - 0.27 * isth * isth) - clamp(0.022 * hl, 0.003, 0.007);
+  }
+  private gillKind(): 'opercle' | 'restricted' | 'pore' | 'slits' | 'none' {
+    const sp = this.sp, id = sp.id;
+    if (sp.gill?.kind) return sp.gill.kind;
+    if (sp.plan === 'ray' || sp.body.disc || sp.group.startsWith('Rays')) return 'none'; // batoid slits are ventral
+    if (sp.mouth.kind === 'disc' || /hagfish|lamprey/.test(id)) return 'none';
+    if (sp.skin.kind === 'placoid') return 'slits';
+    if (sp.HL <= 0.1) return 'none';
+    if (/moray|seahorse|seadragon|pipefish|frogfish|anglerfish/.test(id)) return 'pore';
+    if (sp.group.startsWith('Eels') || /eel|goby|mudskipper|puffer|porcupine|trigger|cowfish|boxfish|ocean-sunfish|ratfish/.test(id)) return 'restricted';
+    return 'opercle';
+  }
+  private pecSpanH() {
+    const f = this.sp.fins.pec;
+    if (!f) return { h: 0.6, dh: 0 };
+    const s1 = clamp(f.s, 0.01, 0.98);
+    return { h: this.phiAtY(s1, this.normY(s1, f.y)) / PI, dh: (0.7 * f.base * Math.cos(f.splay * DEG)) / this.halfPerim(s1) };
+  }
+  private makeGills(): GillOpening[] {
+    const sp = this.sp, hl = sp.HL, e = sp.eye, pec = sp.fins.pec;
+    const kind = this.gillKind();
+    if (kind === 'none') return [];
+    const sH = clamp(hl, 0.03, 0.9);
+    const hwH = this.hw(sH), hp = this.halfPerim(sH);
+    const pk = this.pecSpanH();
+    if (kind === 'slits') {
+      const lay = sp.color.layers?.find((l) => l.k === 'gills') as Extract<Layer, { k: 'gills' }> | undefined;
+      const at = lay?.at?.length ? lay.at : [0, 1, 2, 3, 4].map((i) => hl * (0.8 + 0.07 * i));
+      const h0 = lay?.h0 ?? 0.38;
+      const h1 = Math.max(h0 + 0.12, Math.min(lay?.h1 ?? 0.72, pec ? pk.h - pk.dh - 0.02 : 1));
+      const gap = at.length > 1 ? (at[at.length - 1] - at[0]) / (at.length - 1) : 0.015;
+      const depth = clamp(0.1 * hwH, 0.0025, 0.007), len = Math.min(gap * 0.8, 0.018);
+      return at.map((a0) => ({
+        kind: 'slit' as const, h0, h1, depth, over: 0.0016, thick: 0.0011, arches: 0, amp: 0.55,
+        edge: (h: number) => { const v = ((h - h0) / (h1 - h0)) * 2 - 1; return a0 + 0.003 - 0.005 * v * v; },
+        len: () => len,
+      }));
+    }
+    // the pocket never reaches the orbit or the jaw joint
+    const front = Math.max(e.d > 0 ? e.s + 0.8 * e.d : 0, this.jaw ? this.hinge.s + 0.006 : 0) + 0.01;
